@@ -299,7 +299,8 @@ function M._open_native_diff(old_file_path, new_file_path, new_file_contents, ta
 
   vim.cmd("edit " .. vim.fn.fnameescape(old_file_path))
   vim.cmd("diffthis")
-  vim.cmd("vsplit")
+  local split_cmd = (config and config.diff_opts and config.diff_opts.vertical_split) and "vsplit" or "split"
+  vim.cmd(split_cmd)
   vim.cmd("edit " .. vim.fn.fnameescape(tmp_file))
   vim.api.nvim_buf_set_name(0, new_file_path .. " (New)")
 
@@ -366,13 +367,62 @@ function M._resolve_diff_as_saved(tab_name, buffer_id)
     final_content = final_content .. "\n"
   end
 
-  -- Close diff windows (unified behavior)
-  if diff_data.new_window and vim.api.nvim_win_is_valid(diff_data.new_window) then
-    vim.api.nvim_win_close(diff_data.new_window, true)
+  -- Store the previously active tab before any window operations
+  local previous_tab = vim.api.nvim_get_current_tabpage()
+  local is_new_tab_diff = diff_data.is_new_tab_diff
+  local original_tab = diff_data.original_tab
+
+  -- Update the original buffer with the new content if it exists and is valid
+  if diff_data.original_buffer and vim.api.nvim_buf_is_valid(diff_data.original_buffer) then
+    -- Make the buffer modifiable temporarily
+    local was_modifiable = vim.api.nvim_buf_get_option(diff_data.original_buffer, "modifiable")
+    local was_readonly = vim.api.nvim_buf_get_option(diff_data.original_buffer, "readonly")
+    
+    vim.api.nvim_buf_set_option(diff_data.original_buffer, "modifiable", true)
+    vim.api.nvim_buf_set_option(diff_data.original_buffer, "readonly", false)
+    
+    -- Update the content
+    vim.api.nvim_buf_set_lines(diff_data.original_buffer, 0, -1, false, content_lines)
+    
+    -- Restore original properties
+    vim.api.nvim_buf_set_option(diff_data.original_buffer, "modifiable", was_modifiable)
+    vim.api.nvim_buf_set_option(diff_data.original_buffer, "readonly", was_readonly)
+    
+    logger.debug("diff", "Updated original buffer with new content")
   end
-  if diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
-    vim.api.nvim_set_current_win(diff_data.target_window)
-    vim.cmd("diffoff")
+
+  -- Handle window cleanup based on whether this is a new tab diff
+  if is_new_tab_diff then
+    -- For new tab diffs, close the entire tab
+    if diff_data.new_window and vim.api.nvim_win_is_valid(diff_data.new_window) then
+      local diff_tab = vim.api.nvim_win_get_tabpage(diff_data.new_window)
+      if vim.api.nvim_tabpage_is_valid(diff_tab) then
+        -- Switch to original tab first
+        if original_tab and vim.api.nvim_tabpage_is_valid(original_tab) then
+          vim.api.nvim_set_current_tabpage(original_tab)
+        end
+        -- Close the diff tab
+        vim.schedule(function()
+          if vim.api.nvim_tabpage_is_valid(diff_tab) then
+            local success, err = pcall(function()
+              vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(diff_tab))
+            end)
+            if not success then
+              logger.warn("diff", "Failed to close diff tab:", err)
+            end
+          end
+        end)
+      end
+    end
+  else
+    -- For same tab diffs, close individual windows
+    if diff_data.new_window and vim.api.nvim_win_is_valid(diff_data.new_window) then
+      vim.api.nvim_win_close(diff_data.new_window, true)
+    end
+    if diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
+      vim.api.nvim_set_current_win(diff_data.target_window)
+      vim.cmd("diffoff")
+    end
   end
 
   -- Create MCP-compliant response
@@ -614,8 +664,31 @@ function M._create_diff_view_from_window(target_window, old_file_path, new_buffe
 
   vim.cmd("diffthis")
 
-  vim.cmd("vsplit")
-  local new_win = vim.api.nvim_get_current_win()
+  local split_cmd = (config and config.diff_opts and config.diff_opts.vertical_split) and "vsplit" or "split"
+  local new_win
+  
+  -- Store original tab information
+  local original_tab = vim.api.nvim_get_current_tabpage()
+  local is_new_tab_diff = config and config.diff_opts and not config.diff_opts.open_in_current_tab
+  
+  -- Check if we should open in current tab or create a new tab
+  if is_new_tab_diff then
+    -- Create new tab and set up the diff there
+    local original_buf = vim.api.nvim_win_get_buf(target_window)
+    vim.cmd("tabnew")
+    local new_tab_win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(new_tab_win, original_buf)
+    vim.cmd("diffthis")
+    vim.cmd(split_cmd)
+    new_win = vim.api.nvim_get_current_win()
+    -- Update target_window to point to the window in the new tab
+    target_window = new_tab_win
+  else
+    -- Open diff in current tab
+    vim.cmd(split_cmd)
+    new_win = vim.api.nvim_get_current_win()
+  end
+  
   vim.api.nvim_win_set_buf(new_win, new_buffer)
 
   -- Ensure new buffer inherits filetype from original for syntax highlighting (#20)
@@ -650,6 +723,8 @@ function M._create_diff_view_from_window(target_window, old_file_path, new_buffe
     new_window = new_win,
     target_window = target_window,
     original_buffer = original_buffer,
+    is_new_tab_diff = is_new_tab_diff,
+    original_tab = original_tab,
   }
 end
 
@@ -816,6 +891,8 @@ function M._setup_blocking_diff(params, resolution_callback)
       resolution_callback = resolution_callback,
       result_content = nil,
       is_new_file = is_new_file,
+      is_new_tab_diff = diff_info.is_new_tab_diff,
+      original_tab = diff_info.original_tab,
     })
   end) -- End of pcall
 
@@ -956,6 +1033,13 @@ function M.close_diff_by_tab_name(tab_name)
 
   -- If the diff was already saved, reload file buffers and clean up
   if diff_data.status == "saved" then
+    -- Handle tab restoration for new tab diffs
+    if diff_data.is_new_tab_diff and diff_data.original_tab then
+      if vim.api.nvim_tabpage_is_valid(diff_data.original_tab) then
+        vim.api.nvim_set_current_tabpage(diff_data.original_tab)
+      end
+    end
+    
     -- Claude Code CLI has written the file, reload any open buffers
     if diff_data.old_file_path then
       -- Add a small delay to ensure Claude CLI has finished writing the file
